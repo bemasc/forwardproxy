@@ -91,6 +91,14 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			h.HideVia = true
+		case "template_path":
+			if len(args) != 1 {
+				return d.ArgErr()
+			}
+			if h.TemplatePath != "" {
+				return d.Err("template_path directive specified more than once")
+			}
+			h.TemplatePath = args[0]
 		case "probe_resistance":
 			if len(args) > 1 {
 				return d.ArgErr()

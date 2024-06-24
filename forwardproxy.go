@@ -68,6 +68,10 @@ type Handler struct {
 	// you will give it the host (and port) of the proxy to use.
 	Hosts caddyhttp.MatchHost `json:"hosts,omitempty"`
 
+	// Path of a URI Template (starting with "/") to enable "connect-tcp" mode.
+	// The full template is TemplatePath + "{?target_host,target_port}".
+	TemplatePath string `json:"template_path,omitempty"`
+
 	// Optional probe resistance. (See documentation.)
 	ProbeResistance *ProbeResistance `json:"probe_resistance,omitempty"`
 
@@ -160,7 +164,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	h.dialContext = dialer.DialContext
 	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		return h.dialContextCheckACL(ctx, network, address)
+		return h.dialContextCheckACL(ctx, network, address, nil)
 	}
 
 	if h.Upstream != "" {
@@ -219,7 +223,105 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+func (h *Handler) isTemplatedConnect(r *http.Request) bool {
+	var ret bool
+	if r.ProtoMajor == 1 {
+		ret = r.Method == http.MethodGet &&
+			r.Header.Get("Upgrade") == "connect-tcp"
+	} else {
+		// FIXME: Check "protocol" vs. ":protocol"
+		ret = r.Method == http.MethodConnect &&
+			r.Header.Get(":protocol") == "connect-tcp"
+	}
+
+	return ret &&
+		h.Hosts.Match(r) &&
+		r.URL.Path == h.TemplatePath
+}
+
+func (h *Handler) isClassicConnect(r *http.Request) bool {
+	return r.Method == http.MethodConnect &&
+		r.Header.Get(":protocol") == ""
+}
+
+func (h *Handler) serveTemplated(w http.ResponseWriter, r *http.Request) error {
+	targetHost := r.URL.Query().Get("target_host")
+	targetPort := r.URL.Query().Get("target_port")
+	if targetHost == "" || targetPort == "" {
+		return caddyhttp.Error(http.StatusBadRequest,
+			fmt.Errorf("missing target_host or target_port query parameter"))
+	}
+
+	hostPort := net.JoinHostPort(targetHost, targetPort)
+
+	var successCode int
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Upgrade", "connect-tcp")
+		successCode = http.StatusSwitchingProtocols
+	} else {
+		successCode = http.StatusOK
+	}
+	return h.proxyTCP(w, r, hostPort, successCode)
+}
+
+func (h *Handler) serveClassic(w http.ResponseWriter, r *http.Request) error {
+	if r.ProtoMajor == 2 || r.ProtoMajor == 3 {
+		if len(r.URL.Scheme) > 0 || len(r.URL.Path) > 0 {
+			return caddyhttp.Error(http.StatusBadRequest,
+				fmt.Errorf("CONNECT request has :scheme and/or :path pseudo-header fields"))
+		}
+	}
+
+	hostPort := r.URL.Host
+	if hostPort == "" {
+		hostPort = r.Host
+	}
+	return h.proxyTCP(w, r, hostPort, http.StatusOK)
+}
+
+func (h *Handler) proxyTCP(w http.ResponseWriter, r *http.Request, hostPort string, successCode int) error {
+	// Perform a 0-length read of the response body.  This should trigger a 100 (Continue)
+	// response if "Expect: 100-continue" is present.
+	beforeDial := func() { r.Body.Read(nil) }
+
+	targetConn, err := h.dialContextCheckACL(r.Context(), "tcp", hostPort, beforeDial)
+	if err != nil {
+		return err
+	}
+	if targetConn == nil {
+		// safest to check both error and targetConn afterwards, in case fp.dial (potentially unstable
+		// from x/net/proxy) misbehaves and returns both nil or both non-nil
+		return caddyhttp.Error(http.StatusForbidden,
+			fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
+	}
+	defer targetConn.Close()
+	defer r.Body.Close()
+
+	w.WriteHeader(successCode)
+	switch r.ProtoMajor {
+	case 1: // http1: hijack the whole flow
+		return serveHijack(w, targetConn)
+	case 2: // http2: keep reading from "request" and writing into same response
+		fallthrough
+	case 3:
+		defer r.Body.Close()
+		err := http.NewResponseController(w).Flush()
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError,
+				fmt.Errorf("ResponseWriter flush error: %v", err))
+		}
+		return dualStream(targetConn, r.Body, w)
+	}
+
+	panic("There was a check for http version, yet it's incorrect")
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if r.ProtoMajor != 1 && r.ProtoMajor != 2 && r.ProtoMajor != 3 {
+		return caddyhttp.Error(http.StatusHTTPVersionNotSupported,
+			fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
+	}
+
 	// start by splitting the request host and port
 	reqHost, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -230,30 +332,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if h.AuthCredentials != nil {
 		authErr = h.checkCredentials(r)
 	}
-	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
-		return serveHiddenPage(w, authErr)
-	}
-	if h.Hosts.Match(r) && (r.Method != http.MethodConnect || authErr != nil) {
-		// Always pass non-CONNECT requests to hostname
-		// Pass CONNECT requests only if probe resistance is enabled and not authenticated
-		if h.shouldServePACFile(r) {
-			return h.servePacFile(w, r)
+	if h.ProbeResistance != nil {
+		if len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
+			return serveHiddenPage(w, authErr)
 		}
-		return next.ServeHTTP(w, r)
-	}
-	if authErr != nil {
-		if h.ProbeResistance != nil {
+		if authErr != nil {
 			// probe resistance is requested and requested URI does not match secret domain;
 			// act like this proxy handler doesn't even exist (pass thru to next handler)
 			return next.ServeHTTP(w, r)
 		}
-		w.Header().Set("Proxy-Authenticate", "Basic realm=\"Caddy Secure Web Proxy\"")
-		return caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
 	}
-
-	if r.ProtoMajor != 1 && r.ProtoMajor != 2 && r.ProtoMajor != 3 {
-		return caddyhttp.Error(http.StatusHTTPVersionNotSupported,
-			fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
+	if h.Hosts.Match(r) && h.shouldServePACFile(r) {
+		return h.servePacFile(w, r)
+	}
+	if h.TemplatePath == "" {
+		if h.isClassicConnect(r) {
+			if authErr != nil {
+				w.Header().Set("Proxy-Authenticate", "Basic realm=\"Caddy Secure Web Proxy\"")
+				return caddyhttp.Error(http.StatusProxyAuthRequired, authErr)
+			}
+			return h.serveClassic(w, r)
+		}
+	} else if h.isTemplatedConnect(r) {
+		if authErr != nil {
+			w.Header().Set("WWW-Authenticate", "Basic realm=\"Caddy Secure Web Proxy\"")
+			return caddyhttp.Error(http.StatusUnauthorized, authErr)
+		}
+		return h.serveTemplated(w, r)
 	}
 
 	ctx := context.Background()
@@ -266,49 +371,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		ctxHeader.Add("Forwarded", "for=\""+r.RemoteAddr+"\"")
 		ctx = context.WithValue(ctx, httpclient.ContextKeyHeader{}, ctxHeader)
-	}
-
-	if r.Method == http.MethodConnect {
-		if r.ProtoMajor == 2 || r.ProtoMajor == 3 {
-			if len(r.URL.Scheme) > 0 || len(r.URL.Path) > 0 {
-				return caddyhttp.Error(http.StatusBadRequest,
-					fmt.Errorf("CONNECT request has :scheme and/or :path pseudo-header fields"))
-			}
-		}
-
-		hostPort := r.URL.Host
-		if hostPort == "" {
-			hostPort = r.Host
-		}
-		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
-		if err != nil {
-			return err
-		}
-		if targetConn == nil {
-			// safest to check both error and targetConn afterwards, in case fp.dial (potentially unstable
-			// from x/net/proxy) misbehaves and returns both nil or both non-nil
-			return caddyhttp.Error(http.StatusForbidden,
-				fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
-		}
-		defer targetConn.Close()
-
-		switch r.ProtoMajor {
-		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
-		case 2: // http2: keep reading from "request" and writing into same response
-			fallthrough
-		case 3:
-			defer r.Body.Close()
-			w.WriteHeader(http.StatusOK)
-			err := http.NewResponseController(w).Flush()
-			if err != nil {
-				return caddyhttp.Error(http.StatusInternalServerError,
-					fmt.Errorf("ResponseWriter flush error: %v", err))
-			}
-			return dualStream(targetConn, r.Body, w)
-		}
-
-		panic("There was a check for http version, yet it's incorrect")
 	}
 
 	// Scheme has to be appended to avoid `unsupported protocol scheme ""` error.
@@ -454,8 +516,8 @@ func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// dialContextCheckACL enforces Access Control List and calls fp.DialContext
-func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
+// dialContextCheckACL enforces Access Control List and calls fp.DialContext.
+func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string, beforeDial func()) (net.Conn, error) {
 	var conn net.Conn
 
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
@@ -471,6 +533,9 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 	if h.upstream != nil {
+		if beforeDial != nil {
+			beforeDial()
+		}
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
 		if err != nil {
@@ -502,6 +567,9 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 			continue
 		}
 
+		if beforeDial != nil {
+			beforeDial()
+		}
 		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 		if err == nil {
 			return conn, nil
@@ -573,23 +641,25 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
 func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
-	w.WriteHeader(http.StatusOK)
-	clientConn, brw, err := http.NewResponseController(w).Hijack()
+	controller := http.NewResponseController(w)
+	controller.Flush()
+	clientConn, bufReader, err := controller.Hijack()
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
 			fmt.Errorf("hijack failed: %v", err))
 	}
 	defer clientConn.Close()
 	// bufReader may contain unprocessed buffered data from the client.
-	// snippet borrowed from `proxy` plugin
-	if n := brw.Reader.Buffered(); n > 0 {
-		rbuf, _ := brw.Peek(n)
-		_, _ = targetConn.Write(rbuf)
-	}
-	err = brw.Flush()
-	if err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("failed to flush to client: %v", err))
+	if bufReader != nil {
+		// snippet borrowed from `proxy` plugin
+		if n := bufReader.Reader.Buffered(); n > 0 {
+			rbuf, err := bufReader.Reader.Peek(n)
+			if err != nil {
+				return caddyhttp.Error(http.StatusBadGateway, err)
+			}
+			_, _ = targetConn.Write(rbuf)
+
+		}
 	}
 
 	return dualStream(targetConn, clientConn, clientConn)
@@ -606,6 +676,14 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		buf = buf[0:cap(buf)]
 		_, _err := flushingIoCopy(w, r, buf)
 		bufferPool.Put(bufPtr)
+
+		if _err != nil {
+			if tcpConn, ok := w.(*net.TCPConn); ok {
+				tcpConn.SetLinger(0) // Send a RST.
+			}
+			// TODO: Similar for TLS connections and
+			// HTTP/2+ streams.
+		}
 
 		if cw, ok := w.(closeWriter); ok {
 			_ = cw.CloseWrite()
